@@ -8,6 +8,7 @@ import os
 import logging
 from datetime import timedelta
 
+import typing
 import voluptuous as vol
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
@@ -25,6 +26,8 @@ CONF_IS_HAT_ATTACHED = 'is_hat_attached'
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=60)
 
+MAX_READING_HISTORY_SIZE = 5
+
 SENSOR_TYPES = {
     'temperature': ['temperature', TEMP_CELSIUS],
     'humidity': ['humidity', '%'],
@@ -39,102 +42,104 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 })
 
 
-def get_cpu_temp():
-    """Get CPU temperature."""
-    res = os.popen("vcgencmd measure_temp").readline()
-    t_cpu = float(res.replace("temp=", "").replace("'C\n", ""))
-    return t_cpu
-
-
-def get_average(temp_base):
-    """Use moving average to get better readings."""
-    if not hasattr(get_average, "temp"):
-        get_average.temp = [temp_base, temp_base, temp_base]
-    get_average.temp[2] = get_average.temp[1]
-    get_average.temp[1] = get_average.temp[0]
-    get_average.temp[0] = temp_base
-    temp_avg = (get_average.temp[0] + get_average.temp[1]
-                + get_average.temp[2]) / 3
-    return temp_avg
-
-
-def setup_platform(hass, config, add_devices, discovery_info=None):
+def setup_platform(_, config, add_devices, __=None) -> None:
     """Set up the Sense HAT sensor platform."""
-    data = SenseHatData(config.get(CONF_IS_HAT_ATTACHED))
+    from sense_hat import SenseHat
     dev = []
-    for variable in config[CONF_DISPLAY_OPTIONS]:
-        dev.append(SenseHatSensor(data, variable))
+    for sensor_type in config[CONF_DISPLAY_OPTIONS]:
+        dev.append(SenseHatSensor(SenseHat(), CONF_IS_HAT_ATTACHED, sensor_type))
 
     add_devices(dev, True)
 
 
-class SenseHatSensor(Entity):
-    """Representation of a Sense HAT sensor."""
+def _get_temperature_average(readings: typing.List[typing.Optional[float]]) -> typing.Optional[float]:
+    """"Given a list of temperature readings, work out the average temperature, excluding None's."""
+    valid_readings: typing.List[float] = [r for r in readings if r is not None]
+    if len(valid_readings) == 0:
+        return None
+    return sum(valid_readings) / len(valid_readings)
 
-    def __init__(self, data, sensor_types):
+
+def _get_cpu_temperature() -> float:
+    """Get the CPU temperature."""
+    cpu_temperature_info = os.popen("vcgencmd measure_temp").readline()
+    print(cpu_temperature_info)
+    return float(cpu_temperature_info.replace("temp=", "").replace("'C\n", ""))
+
+
+def _normalise_current_temperature(temperature: typing.Optional[float], hat_attached: bool) -> typing.Optional[float]:
+    """If the SenseHAT is attached to the Pi, its temperature is affected by the CPU
+    temperature and therefore we need to normalise the physical sensor readings."""
+    if temperature is None or not hat_attached:
+        # The SenseHAT is not attached, so we're good with the temperature reported by the physical sensors
+        return temperature
+
+    cpu_temperature = _get_cpu_temperature()
+    return temperature - ((cpu_temperature - temperature) / 1.5)
+
+
+def _update_readings_history(readings_history: typing.List[typing.Optional[float]], new_reading: typing.Optional[float],
+                             max_history_size: int=MAX_READING_HISTORY_SIZE) -> None:
+    readings_history.append(new_reading)
+    if len(readings_history) > max_history_size:
+        for _ in range(len(readings_history) - max_history_size):
+            readings_history.pop(0)
+
+
+class SenseHatSensor(Entity):
+    """Representation of a SenseHAT sensor."""
+
+    def __init__(self, sense_hat: 'SenseHat', hat_attached: bool, sensor_type: str) -> None:
         """Initialize the sensor."""
-        self.data = data
-        self._name = SENSOR_TYPES[sensor_types][0]
-        self._unit_of_measurement = SENSOR_TYPES[sensor_types][1]
-        self.type = sensor_types
+        self._sense_hat = sense_hat
+        self._hat_attached = hat_attached
+        self._type = sensor_type
+        self._name = SENSOR_TYPES[sensor_type][0]
+        self._unit_of_measurement = SENSOR_TYPES[sensor_type][1]
         self._state = None
+        self._readings_history = list()
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def state(self):
+    def state(self) -> typing.Optional[float]:
         """Return the state of the sensor."""
         return self._state
 
     @property
-    def unit_of_measurement(self):
+    def unit_of_measurement(self) -> str:
         """Return the unit the value is expressed in."""
         return self._unit_of_measurement
 
-    def update(self):
-        """Get the latest data and updates the states."""
-        self.data.update()
-        if not self.data.humidity:
-            _LOGGER.error("Don't receive data")
-            return
+    @property
+    def humidity(self) -> typing.Optional[float]:
+        return self._sense_hat.get_humidity()
 
-        if self.type == 'temperature':
-            self._state = self.data.temperature
-        if self.type == 'humidity':
-            self._state = self.data.humidity
-        if self.type == 'pressure':
-            self._state = self.data.pressure
+    @property
+    def pressure(self) -> typing.Optional[float]:
+        return self._sense_hat.get_pressure()
 
+    @property
+    def temperature(self) -> typing.Optional[float]:
+        # Use all the sensors that can report temperature
+        temperature = _get_temperature_average([self._sense_hat.get_temperature_from_humidity(),
+                                                self._sense_hat.get_temperature_from_pressure()])
 
-class SenseHatData(object):
-    """Get the latest data and update."""
+        # If the SenseHAT is attached to the Pi, we need to consider the CPU temperature, too
+        temperature = _normalise_current_temperature(temperature, self._hat_attached)
 
-    def __init__(self, is_hat_attached):
-        """Initialize the data object."""
-        self.temperature = None
-        self.humidity = None
-        self.pressure = None
-        self.is_hat_attached = is_hat_attached
+        # Keep the reading history up to date with the raw (not averaged) values
+        _update_readings_history(self._readings_history, temperature)
+
+        # Return the average of the reading history
+        return _get_temperature_average(self._readings_history)
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES)
     def update(self):
-        """Get the latest data from Sense HAT."""
-        from sense_hat import SenseHat
-        sense = SenseHat()
-        temp_from_h = sense.get_temperature_from_humidity()
-        temp_from_p = sense.get_temperature_from_pressure()
-        t_total = (temp_from_h + temp_from_p) / 2
+        self._state = getattr(self, self._type)
 
-        if self.is_hat_attached:
-            t_cpu = get_cpu_temp()
-            t_correct = t_total - ((t_cpu - t_total) / 1.5)
-            t_correct = get_average(t_correct)
-        else:
-            t_correct = get_average(t_total)
-
-        self.temperature = t_correct
-        self.humidity = sense.get_humidity()
-        self.pressure = sense.get_pressure()
+        if self._state is None:
+            _LOGGER.warning("Unable to update {} sensor reading.".format(self._type))
